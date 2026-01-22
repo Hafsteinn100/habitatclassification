@@ -7,41 +7,33 @@ from tqdm import tqdm
 DATA_DIR = Path(__file__).parent / "data" 
 
 def decode_patch(patch_str):
+    """
+    Decodes the base64 string sent by the judge into a numpy array.
+    Used by api.py.
+    """
     patch_bytes = base64.b64decode(patch_str)
     patch = np.frombuffer(patch_bytes, dtype=np.float32)
     return patch.reshape(15, 35, 35)
 
-def get_stats(patch_section):
-    """Helper to get Mean, Std for a specific section of the image."""
-    mean_val = np.mean(patch_section, axis=(1, 2))
-    std_val = np.std(patch_section, axis=(1, 2))
-    return np.concatenate([mean_val, std_val])
-
 def extract_features(patch):
     """
-    Extracts advanced satellite features with Spatial Awareness.
-    
-    New Strategy: "Spatial Pyramid"
-    1. Global Stats (Whole 35x35)
-    2. Grid Stats (Split into 3x3 grid of approx 11x11 pixels)
-    
-    This allows the model to differentiate "moss in center" vs "moss at edge".
+    SPATIAL PYRAMID FEATURE EXTRACTION
+    Extracts 330 features per image by analyzing the whole image 
+    PLUS a 3x3 grid of sub-sections.
     """
     
-    # --- Helper to calculate stats for a block ---
+    # --- Helper to calculate stats for a block of pixels ---
     def get_pixel_stats(pixels):
         # pixels shape: (15, N_pixels)
-        # We want mean and std for each band (30 features)
         mean = np.mean(pixels, axis=1) # Shape (15,)
         std = np.std(pixels, axis=1)   # Shape (15,)
         
-        # Spectral Indices Stats (Mean ONLY to save dims)
+        # Spectral Indices Stats (Mean ONLY)
         green = pixels[2]
         red = pixels[3]
         nir = pixels[7]
         epsilon = 1e-8
         
-        # Calculate indices per pixel then take mean
         ndvi_mean = np.mean((nir - red) / (nir + red + epsilon))
         ndwi_mean = np.mean((green - nir) / (green + nir + epsilon))
         gndvi_mean = np.mean((nir - green) / (nir + green + epsilon))
@@ -52,36 +44,33 @@ def extract_features(patch):
             [ndvi_mean, ndwi_mean, gndvi_mean]
         ])
 
-    # 1. Global Features (The original strategy)
-    # Flatten spatial dims: (15, 35, 35) -> (15, 1225)
+    # 1. Global Features (Whole Image)
     global_pixels = patch.reshape(15, -1)
     global_feats = get_pixel_stats(global_pixels)
     
     # 2. Grid Features (3x3 Split)
-    # 35 pixels / 3 is approx 11. 
-    # Slices: 0-11, 11-23, 23-35
-    h_slices = [slice(0, 11), slice(11, 23), slice(23, 35)]
-    w_slices = [slice(0, 11), slice(11, 23), slice(23, 35)]
+    # 35 pixels / 3 is approx 11. Slices: 0-11, 11-23, 23-35
+    slices = [slice(0, 11), slice(11, 23), slice(23, 35)]
     
     grid_feats = []
     
-    for hs in h_slices:
-        for ws in w_slices:
+    for h_s in slices:
+        for w_s in slices:
             # Extract sub-patch
-            sub_patch = patch[:, hs, ws]
-            # Flatten
+            sub_patch = patch[:, h_s, w_s]
+            # Flatten and get stats
             sub_pixels = sub_patch.reshape(15, -1)
-            # Calc stats
-            feats = get_pixel_stats(sub_pixels)
-            grid_feats.append(feats)
+            grid_feats.append(get_pixel_stats(sub_pixels))
             
-    # Concatenate everything
-    # Global (33 feats) + 9 * Grid (33 feats) = 330 features
+    # Concatenate everything: Global (33) + 9 * Grid (33) = 330 features
     return np.concatenate([global_feats] + grid_feats)
 
 def load_data():
-    """Simple and robust loader."""
-    print("Loading data from standard paths...")
+    """
+    ULTIMATE LOADER: Includes 4x Data Augmentation.
+    Rotates every image 0, 90, 180, and 270 degrees.
+    """
+    print("Loading raw data...")
     
     # Paths
     base_dir = DATA_DIR
@@ -91,25 +80,47 @@ def load_data():
     
     # Load Labels
     df = pd.read_csv(labels_path)
-    labels = df["vistgerd_idx"].values
+    original_labels = df["vistgerd_idx"].values
     
     # Load Patches
-    # Check if files exist
     if not part1_path.exists():
-         # Try fallback (maybe they are directly in data?)
+         # Fallback path check if files are not in a 'train' subfolder
          part1_path = base_dir / "patches_part1.npy"
          part2_path = base_dir / "patches_part2.npy"
          
     p1 = np.load(part1_path)
     p2 = np.load(part2_path)
-    patches = np.concatenate([p1, p2], axis=0)
+    original_patches = np.concatenate([p1, p2], axis=0)
     
-    print(f"Patches loaded: {patches.shape}")
+    print(f"Original dataset size: {original_patches.shape[0]} images")
+    print("Applying 4x AUGMENTATION (Rotations 0, 90, 180, 270)...")
     
-    # Extract features
     X = []
-    print("Extracting features (This is fast)...")
-    for p in tqdm(patches):
-        X.append(extract_features(p))
+    y = []
+    
+    # Augmentation Loop
+    for patch, label in tqdm(zip(original_patches, original_labels), total=len(original_patches)):
+        # 1. Original (0 deg)
+        X.append(extract_features(patch))
+        y.append(label)
         
-    return np.array(X), labels
+        # 2. Rotate 90 deg
+        p90 = np.rot90(patch, k=1, axes=(1, 2))
+        X.append(extract_features(p90))
+        y.append(label)
+        
+        # 3. Rotate 180 deg
+        p180 = np.rot90(patch, k=2, axes=(1, 2))
+        X.append(extract_features(p180))
+        y.append(label)
+        
+        # 4. Rotate 270 deg
+        p270 = np.rot90(patch, k=3, axes=(1, 2))
+        X.append(extract_features(p270))
+        y.append(label)
+        
+    X = np.array(X, dtype=np.float32) # Memory Optimization
+    y = np.array(y)
+    
+    print(f"Final Augmented Dataset Shape: {X.shape}")
+    return X, y
