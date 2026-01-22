@@ -19,95 +19,97 @@ def get_stats(patch_section):
 
 def extract_features(patch):
     """
-    Extracts Global Stats + Quadrant Stats + Indices.
-    Now the model knows WHERE things are (Top-Left vs Center, etc.)
+    Extracts advanced satellite features with Spatial Awareness.
+    
+    New Strategy: "Spatial Pyramid"
+    1. Global Stats (Whole 35x35)
+    2. Grid Stats (Split into 3x3 grid of approx 11x11 pixels)
+    
+    This allows the model to differentiate "moss in center" vs "moss at edge".
     """
-    # 1. Global Indices (NDVI, NDWI) - Best calculated on the whole image
-    # Bands: 2=Green, 3=Red, 7=NIR
-    green = patch[2]
-    red = patch[3]
-    nir = patch[7]
-    epsilon = 1e-8
     
-    ndvi = np.mean((nir - red) / (nir + red + epsilon))
-    ndwi = np.mean((green - nir) / (green + nir + epsilon))
-    gndvi = np.mean((nir - green) / (nir + green + epsilon))
-    
-    indices = [ndvi, ndwi, gndvi]
+    # --- Helper to calculate stats for a block ---
+    def get_pixel_stats(pixels):
+        # pixels shape: (15, N_pixels)
+        # We want mean and std for each band (30 features)
+        mean = np.mean(pixels, axis=1) # Shape (15,)
+        std = np.std(pixels, axis=1)   # Shape (15,)
+        
+        # Spectral Indices Stats (Mean ONLY to save dims)
+        green = pixels[2]
+        red = pixels[3]
+        nir = pixels[7]
+        epsilon = 1e-8
+        
+        # Calculate indices per pixel then take mean
+        ndvi_mean = np.mean((nir - red) / (nir + red + epsilon))
+        ndwi_mean = np.mean((green - nir) / (green + nir + epsilon))
+        gndvi_mean = np.mean((nir - green) / (nir + green + epsilon))
+        
+        return np.concatenate([
+            mean, 
+            std, 
+            [ndvi_mean, ndwi_mean, gndvi_mean]
+        ])
 
-    # 2. Global Stats (The old way)
-    global_stats = get_stats(patch)
+    # 1. Global Features (The original strategy)
+    # Flatten spatial dims: (15, 35, 35) -> (15, 1225)
+    global_pixels = patch.reshape(15, -1)
+    global_feats = get_pixel_stats(global_pixels)
     
-    # 3. Quadrant Stats (The NEW Spatial way)
-    # Image is 35x35. Midpoint is roughly 17.
-    # We slice the array: patch[:, Y_start:Y_end, X_start:X_end]
-    mid = 17
+    # 2. Grid Features (3x3 Split)
+    # 35 pixels / 3 is approx 11. 
+    # Slices: 0-11, 11-23, 23-35
+    h_slices = [slice(0, 11), slice(11, 23), slice(23, 35)]
+    w_slices = [slice(0, 11), slice(11, 23), slice(23, 35)]
     
-    # Top-Left
-    q1 = patch[:, :mid, :mid]
-    stats_q1 = get_stats(q1)
+    grid_feats = []
     
-    # Top-Right
-    q2 = patch[:, :mid, mid:]
-    stats_q2 = get_stats(q2)
-    
-    # Bottom-Left
-    q3 = patch[:, mid:, :mid]
-    stats_q3 = get_stats(q3)
-    
-    # Bottom-Right
-    q4 = patch[:, mid:, mid:]
-    stats_q4 = get_stats(q4)
-    
-    # 4. Combine ALL features
-    # This creates a massive feature vector (Global + 4 Quadrants + Indices)
-    return np.concatenate([
-        global_stats, 
-        stats_q1, stats_q2, stats_q3, stats_q4, 
-        indices
-    ])
+    for hs in h_slices:
+        for ws in w_slices:
+            # Extract sub-patch
+            sub_patch = patch[:, hs, ws]
+            # Flatten
+            sub_pixels = sub_patch.reshape(15, -1)
+            # Calc stats
+            feats = get_pixel_stats(sub_pixels)
+            grid_feats.append(feats)
+            
+    # Concatenate everything
+    # Global (33 feats) + 9 * Grid (33 feats) = 330 features
+    return np.concatenate([global_feats] + grid_feats)
 
 def load_data():
-    """Smart loader (Same as before)"""
-    csv_path = DATA_DIR / "train.csv"
-    if not csv_path.exists():
-        csv_path = DATA_DIR / "train_labels.csv"
-        
-    df = pd.read_csv(csv_path)
+    """Simple and robust loader."""
+    print("Loading data from standard paths...")
     
-    # Auto-detect folder
-    # (Assuming you fixed the folder structure as discussed previously)
-    # If using the 'smart search' version, paste that load_data function here.
-    # For simplicity, here is the standard dual-folder search:
+    # Paths
+    base_dir = DATA_DIR
+    part1_path = base_dir / "train" / "patches_part1.npy"
+    part2_path = base_dir / "train" / "patches_part2.npy"
+    labels_path = base_dir / "train.csv"
     
-    possible_folders = [DATA_DIR / "patches_part1", DATA_DIR / "patches_part2", DATA_DIR / "train" / "patches_part1"]
+    # Load Labels
+    df = pd.read_csv(labels_path)
+    labels = df["vistgerd_idx"].values
     
+    # Load Patches
+    # Check if files exist
+    if not part1_path.exists():
+         # Try fallback (maybe they are directly in data?)
+         part1_path = base_dir / "patches_part1.npy"
+         part2_path = base_dir / "patches_part2.npy"
+         
+    p1 = np.load(part1_path)
+    p2 = np.load(part2_path)
+    patches = np.concatenate([p1, p2], axis=0)
+    
+    print(f"Patches loaded: {patches.shape}")
+    
+    # Extract features
     X = []
-    y = []
-    
-    print("Extracting SPATIAL features...")
-    
-    # Find where images are hiding
-    valid_folders = [p for p in possible_folders if p.exists()]
-    if not valid_folders:
-         # Fallback search
-         valid_folders = list(DATA_DIR.rglob("*.npy"))
-         if valid_folders: valid_folders = [valid_folders[0].parent]
-    
-    for _, row in tqdm(df.iterrows(), total=len(df)):
-        file_id = row['sample_id'] # Check your CSV column name!
-        label = row['vistgerd_idx']
+    print("Extracting features (This is fast)...")
+    for p in tqdm(patches):
+        X.append(extract_features(p))
         
-        found = False
-        for folder in valid_folders:
-            img_path = folder / f"{file_id}.npy"
-            if img_path.exists():
-                try:
-                    patch = np.load(img_path)
-                    X.append(extract_features(patch))
-                    y.append(label)
-                    found = True
-                    break
-                except: pass
-        
-    return np.array(X), np.array(y)
+    return np.array(X), labels
